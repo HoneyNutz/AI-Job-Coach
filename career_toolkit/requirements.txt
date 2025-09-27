@@ -1,0 +1,7 @@
+streamlit
+pydantic
+beautifulsoup4
+requests
+sentence-transformers
+openai
+typst
