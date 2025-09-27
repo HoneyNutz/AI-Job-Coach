@@ -89,3 +89,8 @@ venv.bak
 
 # Output folder
 /output/
+
+# User-specific assets and sensitive data
+/career_toolkit/user_assets/
+/career_toolkit/backup_resume.json
+
