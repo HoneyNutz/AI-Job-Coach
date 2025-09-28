@@ -2,6 +2,8 @@ import streamlit as st
 import os
 import shutil
 import subprocess
+import json
+from datetime import datetime
 from agents.data_agent import Resume, JobDescription
 from agents.scraper_agent import ScraperAgent
 from agents.analysis_agent import AnalysisAgent
@@ -9,10 +11,10 @@ from agents.generation_agent import GenerationAgent
 
 # --- Agent Initialization ---
 @st.cache_resource
-def load_agents():
-    return ScraperAgent(), AnalysisAgent(), GenerationAgent()
+def load_agents(api_key: str):
+    return ScraperAgent(), AnalysisAgent(), GenerationAgent(api_key=api_key)
 
-scraper_agent, analysis_agent, generation_agent = load_agents()
+scraper_agent, analysis_agent, generation_agent = load_agents(st.session_state.get("openai_api_key"))
 
 # --- App State Management ---
 USER_ASSETS_DIR = "career_toolkit/user_assets"
@@ -69,6 +71,8 @@ def initialize_session_state():
         st.session_state.recipient_title = "Talent Acquisition"
     if 'company_address' not in st.session_state:
         st.session_state.company_address = ""
+    if 'current_page' not in st.session_state:
+        st.session_state.current_page = "main_app" # Default page
     if 'analysis_results' not in st.session_state:
         st.session_state.analysis_results = None
 
@@ -158,7 +162,6 @@ def render_enter_jd():
             return
         
         with st.spinner("Analyzing job description..."):
-            generation_agent.api_key = st.session_state.openai_api_key
             extracted_data = generation_agent.extract_job_details(jd_text)
             
             # Check for inferred skills
@@ -189,16 +192,10 @@ def render_jd_processed():
 
     st.markdown("--- ")
     st.markdown("What would you like to do next?")
-    col1, col2, col3 = st.columns([1,1,1])
-    if col1.button("← Back to Job Entry"):
-        st.session_state.step = "enter_jd"
-        st.rerun()
-    if col2.button("Identify Skill Gaps"):
+    if st.button("Analyze Resume & Generate Documents"):
         st.session_state.step = "skill_gap"
         st.rerun()
-    if col3.button("Generate Cover Letter"):
-        st.session_state.step = "cover_letter"
-        st.rerun()
+
 
 def render_skill_gap():
     st.header("🔍 Skill Gap Analysis & Resume Editor")
@@ -220,91 +217,68 @@ def render_skill_gap():
     st.markdown("Click the button below to generate a comprehensive, strategic blueprint for optimizing your resume for this specific job.")
 
     if st.button("✨ Generate Resume Optimization Blueprint", use_container_width=True):
-        st.session_state.blueprint_parts = {}
-        st.session_state.generating_blueprint = True
-
-    if st.session_state.get('generating_blueprint'):
-        generation_agent.api_key = st.session_state.openai_api_key
         resume = st.session_state.resume
         jd = st.session_state.job_description
 
-        # Part 1: Strategic Assessment
-        if 'assessment' not in st.session_state.blueprint_parts:
-            with st.spinner("Step 1/4: Performing strategic assessment..."):
-                assessment = generation_agent.blueprint_step_1_strategic_assessment(resume, jd)
-                st.session_state.blueprint_parts['assessment'] = assessment
-                st.rerun()
-        assessment = st.session_state.blueprint_parts['assessment']
-        st.subheader("1. Strategic Assessment")
-        if 'error' not in assessment:
-            st.markdown(f"* **Position Alignment Score:** {assessment.get('alignment_score', 'N/A')}")
-            st.markdown(f"* **Overall Fitness:** {assessment.get('overall_fitness', 'N/A')}")
-            st.markdown("* **Key Opportunity Areas:**")
-            for opp in assessment.get('key_opportunities', []):
-                st.markdown(f"  * {opp}")
-        else:
-            st.error(assessment['error'])
-        st.divider()
+        with st.status("Generating your strategic resume blueprint...", expanded=True) as status:
+            # Part 1: Strategic Assessment
+            status.write("Step 1/4: Performing strategic assessment...")
+            assessment = generation_agent.blueprint_step_1_strategic_assessment(resume, jd)
+            st.subheader("1. Strategic Assessment")
+            if 'error' not in assessment:
+                st.markdown(f"* **Position Alignment Score:** {assessment.get('alignment_score', 'N/A')}")
+                st.markdown(f"* **Overall Fitness:** {assessment.get('overall_fitness', 'N/A')}")
+                st.markdown("* **Key Opportunity Areas:**")
+                for opp in assessment.get('key_opportunities', []):
+                    st.markdown(f"  * {opp}")
+            else:
+                st.error(assessment['error'])
+            st.divider()
 
-        # Part 2: Keyword Table
-        if 'keyword_table' not in st.session_state.blueprint_parts:
-            with st.spinner("Step 2/4: Analyzing keyword alignment..."):
-                keywords = generation_agent.blueprint_step_2_keyword_table(resume, jd)
-                st.session_state.blueprint_parts['keyword_table'] = keywords
-                st.rerun()
-        keywords = st.session_state.blueprint_parts['keyword_table']
-        st.subheader("2. Content & Keyword Enhancements")
-        st.markdown("### Keyword Optimization Table")
-        if 'error' not in keywords:
-            for item in keywords:
-                st.markdown(f"**{item.get('keyword')}**")
-                col1, col2, col3 = st.columns(3)
-                found_text = "✅ Found" if item.get('found') else "❌ Missing"
-                col1.metric("Status", found_text)
-                col2.metric("Priority", item.get('priority', 'N/A'))
-                confidence = item.get('confidence', 0)
-                col3.progress(confidence / 100)
-                col3.caption(f"Confidence: {confidence}%")
-                st.warning(f"**Suggested Action:** {item.get('action')}")
-                st.divider()
-        else:
-            st.error(keywords['error'])
-        st.divider()
-
-        # Part 3: Recommended Summary
-        if 'summary' not in st.session_state.blueprint_parts:
-            with st.spinner("Step 3/4: Rewriting professional summary..."):
-                summary = generation_agent.blueprint_step_3_summary(resume, jd)
-                st.session_state.blueprint_parts['summary'] = summary
-                st.rerun()
-        st.markdown("### Recommended Professional Summary")
-        st.info(st.session_state.blueprint_parts['summary'])
-        st.divider()
-
-        # Part 4: Achievement Bullet Points
-        if 'achievements' not in st.session_state.blueprint_parts:
-            st.session_state.blueprint_parts['achievements'] = []
-            with st.spinner("Step 4/4: Rewriting achievement bullet points..."):
-                for work_item in resume.work:
-                    if work_item.highlights:
-                        for highlight in work_item.highlights:
-                            achievement = generation_agent.blueprint_step_4_achievements(highlight, work_item.name, jd)
-                            st.session_state.blueprint_parts['achievements'].append(achievement)
-                st.rerun()
-        st.markdown("### Achievement-Driven Bullet Points")
-        results = st.session_state.blueprint_parts['achievements']
-        if results:
-            for result in results:
-                if 'error' not in result:
-                    st.markdown(f"* **Original:** {result['original_bullet']}")
-                    st.success(f"* **Optimized (STAR-D):** {result['optimized_bullet']}")
-                    st.caption(f"**Rationale:** {result['rationale']}")
+            # Part 2: Keyword Table
+            status.write("Step 2/4: Analyzing keyword alignment...")
+            keywords = generation_agent.blueprint_step_2_keyword_table(resume, jd)
+            st.subheader("2. Content & Keyword Enhancements")
+            st.markdown("### Keyword Optimization Table")
+            if 'error' not in keywords:
+                for item in keywords:
+                    st.markdown(f"**{item.get('keyword')}**")
+                    col1, col2, col3 = st.columns(3)
+                    found_text = "✅ Found" if item.get('found') else "❌ Missing"
+                    col1.metric("Status", found_text)
+                    col2.metric("Priority", item.get('priority', 'N/A'))
+                    confidence = item.get('confidence', 0)
+                    col3.progress(confidence / 100)
+                    col3.caption(f"Confidence: {confidence}%")
+                    st.warning(f"**Suggested Action:** {item.get('action')}")
                     st.divider()
-                else:
-                    st.error(result['error'])
-        
-        st.session_state.generating_blueprint = False # Mark as complete
-        st.success("Blueprint generation complete!")
+            else:
+                st.error(keywords['error'])
+            st.divider()
+
+            # Part 3: Recommended Summary
+            status.write("Step 3/4: Rewriting professional summary...")
+            summary = generation_agent.blueprint_step_3_summary(resume, jd)
+            st.markdown("### Recommended Professional Summary")
+            st.info(summary)
+            st.divider()
+
+            # Part 4: Achievement Bullet Points
+            status.write("Step 4/4: Rewriting achievement bullet points...")
+            st.markdown("### Achievement-Driven Bullet Points")
+            for work_item in resume.work:
+                if work_item.highlights:
+                    for highlight in work_item.highlights:
+                        result = generation_agent.blueprint_step_4_achievements(highlight, work_item.name, jd)
+                        if 'error' not in result:
+                            st.markdown(f"* **Original:** {result['original_bullet']}")
+                            st.success(f"* **Optimized (STAR-D):** {result['optimized_bullet']}")
+                            st.caption(f"**Rationale:** {result['rationale']}")
+                            st.divider()
+                        else:
+                            st.error(result['error'])
+            
+            status.update(label="Blueprint generation complete!", state="complete", expanded=False)
 
     st.markdown("--- ")
     st.markdown("### 📝 Live Resume Editor")
@@ -323,6 +297,16 @@ def render_skill_gap():
 
     col1, col2, col3 = st.columns([1, 1, 1])
     if col1.button("Save & Archive", use_container_width=True):
+        # Create initial notes file
+        notes_path = os.path.join(output_folder, "notes.json")
+        if not os.path.exists(notes_path):
+            initial_notes = {
+                "status": "Not Applied",
+                "applied_date": None,
+                "closed_date": None,
+                "comments": ""
+            }
+            save_job_notes(output_folder, initial_notes)
         try:
             # Validate the edited JSON
             new_resume = Resume.model_validate_json(edited_resume_json)
@@ -391,14 +375,11 @@ def render_cover_letter():
     # --- Cover Letter Text Generation and Editing ---
     st.markdown("#### Cover Letter Content")
     if st.button("Generate/Regenerate AI Cover Letter"):
-        company_homepage = generation_agent.get_company_homepage_from_jd(st.session_state.job_description)
-        if not company_homepage:
-            st.warning("Could not find a company homepage. Please provide one for better results.")
-        with st.spinner("Researching company and crafting your cover letter..."):
-            company_info = scraper_agent.scrape_company_homepage(company_homepage or "")
-            generation_agent.api_key = st.session_state.openai_api_key
+        with st.spinner("Crafting your cover letter..."):
             st.session_state.cover_letter = generation_agent.generate_cover_letter(
-                st.session_state.resume, st.session_state.job_description, company_info
+                st.session_state.resume, 
+                st.session_state.job_description, 
+                st.session_state.recipient_name
             )
 
     st.session_state.cover_letter = st.text_area(
@@ -473,12 +454,106 @@ def render_cover_letter():
             except Exception as e:
                 st.error(f"An unexpected error occurred: {e}")
 
+def get_job_notes(job_folder_path: str) -> dict:
+    """Reads the notes.json file for a given job."""
+    notes_path = os.path.join(job_folder_path, "notes.json")
+    if os.path.exists(notes_path):
+        with open(notes_path, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_job_notes(job_folder_path: str, notes: dict):
+    """Saves the notes dictionary to notes.json."""
+    notes_path = os.path.join(job_folder_path, "notes.json")
+    with open(notes_path, 'w') as f:
+        json.dump(notes, f, indent=2)
+
+def render_job_tracker():
+    st.header("📈 Job Application Tracker")
+    st.markdown("Here you can view and manage all of your analyzed job applications.")
+
+    output_dir = "output"
+    if not os.path.exists(output_dir) or not os.listdir(output_dir):
+        st.info("No job applications have been saved yet. Analyze a job to get started!")
+        return
+
+    job_folders = [d for d in os.listdir(output_dir) if os.path.isdir(os.path.join(output_dir, d))]
+    
+    for job_folder in sorted(job_folders):
+        job_path = os.path.join(output_dir, job_folder)
+        notes = get_job_notes(job_path)
+
+        with st.container():
+            col1, col2, col3, col4 = st.columns([3, 2, 1, 1])
+            col1.subheader(job_folder.replace('_', ' '))
+            col2.metric("Status", notes.get("status", "N/A"))
+
+            if col3.button("View / Edit Notes", key=f"notes_{job_folder}"):
+                st.session_state.editing_notes_for = job_folder
+
+            if col4.button("Delete", key=f"delete_{job_folder}"):
+                if st.session_state.get(f"confirm_delete_{job_folder}"):
+                    shutil.rmtree(job_path)
+                    st.success(f"Successfully deleted application for {job_folder}.")
+                    st.session_state[f"confirm_delete_{job_folder}"] = False # Reset state
+                    st.rerun()
+                else:
+                    st.session_state[f"confirm_delete_{job_folder}"] = True
+                    st.rerun()
+            
+            if st.session_state.get(f"confirm_delete_{job_folder}"):
+                st.error(f"Are you sure? This action is permanent.")
+                st.button("Confirm Deletion", on_click=lambda jf=job_folder: setattr(st.session_state, f"confirm_delete_{jf}", True), key=f"confirm_btn_{job_folder}")
+
+            st.divider()
+
+    # --- Notes Editing Modal ---
+    if 'editing_notes_for' in st.session_state and st.session_state.editing_notes_for:
+        job_folder = st.session_state.editing_notes_for
+        job_path = os.path.join(output_dir, job_folder)
+        notes = get_job_notes(job_path)
+
+        with st.form(key=f"notes_form_{job_folder}"):
+            st.subheader(f"Editing Notes for: {job_folder.replace('_', ' ')}")
+            
+            status_options = ["Not Applied", "Applied", "Interviewing", "Offer Received", "Offer Accepted", "Closed/Rejected"]
+            current_status = notes.get("status", "Not Applied")
+            new_status = st.selectbox("Application Status", options=status_options, index=status_options.index(current_status))
+
+            applied_date = st.date_input("Date Applied", value=None if not notes.get("applied_date") else datetime.fromisoformat(notes.get("applied_date")))
+            closed_date = st.date_input("Date Closed", value=None if not notes.get("closed_date") else datetime.fromisoformat(notes.get("closed_date")))
+            comments = st.text_area("Comments", value=notes.get("comments", ""))
+
+            submitted = st.form_submit_button("Save Notes")
+            if submitted:
+                updated_notes = {
+                    "status": new_status,
+                    "applied_date": applied_date.isoformat() if applied_date else None,
+                    "closed_date": closed_date.isoformat() if closed_date else None,
+                    "comments": comments
+                }
+                save_job_notes(job_path, updated_notes)
+                st.success("Notes saved!")
+                st.session_state.editing_notes_for = None
+                st.rerun()
+
 # --- Main App Logic ---
 initialize_session_state()
 
 st.title("🤖 AI Job Coach")
 
-# --- Sidebar ---
+# --- Sidebar Navigation ---
+st.sidebar.header("Navigation")
+page = st.sidebar.radio("Go to", ["AI Job Coach", "Job Tracker"], key="nav")
+
+if page == "Job Tracker":
+    st.session_state.current_page = "job_tracker"
+else:
+    st.session_state.current_page = "main_app"
+
+st.sidebar.markdown("--- ")
+
+# --- Sidebar Configuration ---
 st.sidebar.header("Configuration")
 st.session_state.openai_api_key = st.sidebar.text_input(
     "OpenAI API Key", type="password", value=st.session_state.openai_api_key
@@ -492,15 +567,18 @@ if st.sidebar.button("Update Settings (Resume/Signature)"):
     st.rerun()
 
 # --- Main Content ---
-if st.session_state.step == "settings":
-    render_settings()
-elif st.session_state.step == "update_resume":
-    render_update_resume()
-elif st.session_state.step == "enter_jd":
-    render_enter_jd()
-elif st.session_state.step == "jd_processed":
-    render_jd_processed()
-elif st.session_state.step == "skill_gap":
-    render_skill_gap()
-elif st.session_state.step == "cover_letter":
-    render_cover_letter()
+if st.session_state.current_page == "job_tracker":
+    render_job_tracker()
+else:
+    if st.session_state.step == "settings":
+        render_settings()
+    elif st.session_state.step == "update_resume":
+        render_update_resume()
+    elif st.session_state.step == "enter_jd":
+        render_enter_jd()
+    elif st.session_state.step == "jd_processed":
+        render_jd_processed()
+    elif st.session_state.step == "skill_gap":
+        render_skill_gap()
+    elif st.session_state.step == "cover_letter":
+        render_cover_letter()
