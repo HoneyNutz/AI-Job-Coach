@@ -39,13 +39,11 @@ def initialize_session_state():
         # Load Signature
         st.session_state.signature_content = None
         st.session_state.signature_filename = ""
-        for ext in ["png", "jpg", "jpeg", "svg"]:
-            sig_path = os.path.join(USER_ASSETS_DIR, f"signature.{ext}")
-            if os.path.exists(sig_path):
-                with open(sig_path, "rb") as f:
-                    st.session_state.signature_content = f.read()
-                st.session_state.signature_filename = os.path.basename(sig_path)
-                break
+        sig_path = os.path.join(USER_ASSETS_DIR, "signature.png")
+        if os.path.exists(sig_path):
+            with open(sig_path, "rb") as f:
+                st.session_state.signature_content = f.read()
+            st.session_state.signature_filename = "signature.png"
         
         st.session_state.assets_loaded = True
 
@@ -101,21 +99,19 @@ def render_settings():
 
     # --- Signature Upload ---
     st.subheader("2. Your Signature")
-    signature_uploader = st.file_uploader("Upload your signature image (PNG, JPG, SVG)", type=["png", "jpg", "jpeg", "svg"])
+    signature_uploader = st.file_uploader("Upload your signature image (PNG format recommended)", type=["png", "jpg", "jpeg", "svg"])
     if signature_uploader is not None:
+        # Standardize filename to signature.png
+        new_filename = "signature.png"
+        
         # Save to session state
         st.session_state.signature_content = signature_uploader.read()
-        st.session_state.signature_filename = signature_uploader.name
-        
-        # Clear old signature files
-        for f in os.listdir(USER_ASSETS_DIR):
-            if f.startswith("signature."):
-                os.remove(os.path.join(USER_ASSETS_DIR, f))
+        st.session_state.signature_filename = new_filename
         
         # Save new signature persistently
-        with open(os.path.join(USER_ASSETS_DIR, signature_uploader.name), "wb") as f:
+        with open(os.path.join(USER_ASSETS_DIR, new_filename), "wb") as f:
             f.write(st.session_state.signature_content)
-        st.success(f"Signature '{signature_uploader.name}' updated and saved!")
+        st.success(f"Signature updated and saved as '{new_filename}'!")
     
     if st.session_state.signature_content:
         st.markdown("**Current Signature:**")
@@ -162,6 +158,12 @@ def render_enter_jd():
             return
         
         with st.spinner("Analyzing job description..."):
+            # Reset blueprint state for the new job
+            if 'blueprint_generated' in st.session_state:
+                st.session_state.blueprint_generated = False
+            if 'blueprint_parts' in st.session_state:
+                st.session_state.blueprint_parts = {}
+
             extracted_data = generation_agent.extract_job_details(jd_text)
             
             # Check for inferred skills
@@ -197,88 +199,128 @@ def render_jd_processed():
         st.rerun()
 
 
+def render_blueprint_content():
+    """Renders the interactive blueprint UI from data in session state."""
+    resume = st.session_state.resume
+    assessment = st.session_state.blueprint_parts.get('assessment', {})
+    keywords = st.session_state.blueprint_parts.get('keyword_table', [])
+
+    st.subheader("1. Strategic Assessment")
+    if 'error' not in assessment:
+        st.markdown(f"* **Position Alignment Score:** {assessment.get('alignment_score', 'N/A')}")
+        st.markdown(f"* **Overall Fitness:** {assessment.get('overall_fitness', 'N/A')}")
+        st.markdown("* **Key Opportunity Areas:**")
+        for opp in assessment.get('key_opportunities', []):
+            st.markdown(f"  * {opp}")
+    else:
+        st.error(assessment.get('error', 'Failed to generate assessment.'))
+    st.divider()
+
+    st.subheader("2. Content & Keyword Enhancements")
+    st.markdown("### Keyword Optimization Table")
+    if isinstance(keywords, list):
+        for item in keywords:
+            st.markdown(f"**{item.get('keyword')}**")
+            col1, col2, col3 = st.columns(3)
+            found_text = "✅ Found" if item.get('found') else "❌ Missing"
+            col1.metric("Status", found_text)
+            col2.metric("Priority", item.get('priority', 'N/A'))
+            confidence = item.get('confidence', 0)
+            col3.progress(confidence / 100)
+            col3.caption(f"Confidence: {confidence}%")
+            st.warning(f"**Suggested Action:** {item.get('action')}")
+            st.divider()
+    else:
+        st.error(keywords.get('error', 'Failed to generate keyword table.'))
+    st.divider()
+
+    st.markdown("### Recommended Professional Summary")
+    edited_summary = st.text_area("Edit the AI-generated summary below:", value=st.session_state.blueprint_parts.get('editable_summary', ''), height=150, key="editable_summary_area")
+    if st.button("Update Resume Summary"):
+        st.session_state.resume.basics.summary = edited_summary
+        st.success("Professional summary updated in the resume editor below!")
+        st.rerun()
+    st.divider()
+
+    st.markdown("### Achievement-Driven Bullet Points")
+    for key, result in st.session_state.blueprint_parts.get('achievements', {}).items():
+        try:
+            work_idx, highlight_idx = map(int, key.split('_'))
+            if work_idx >= len(st.session_state.resume.work) or highlight_idx >= len(st.session_state.resume.work[work_idx].highlights):
+                continue
+
+            st.markdown(f"**For your role at {st.session_state.resume.work[work_idx].name}:**")
+            st.markdown(f"* **Original:** {result['original_bullet']}")
+            
+            edited_bullet = st.text_area(
+                "Edit the AI-optimized bullet point:", 
+                value=result['optimized_bullet'], 
+                key=f"editable_bullet_{key}",
+                height=100
+            )
+            st.caption(f"**Rationale:** {result['rationale']}")
+
+            if st.button("Apply this suggestion", key=f"apply_{key}"):
+                if st.session_state.resume.work[work_idx].highlights[highlight_idx] == result['original_bullet']:
+                    st.session_state.resume.work[work_idx].highlights[highlight_idx] = edited_bullet
+                    st.success("Suggestion applied! The resume editor below has been updated.")
+                    del st.session_state.blueprint_parts['achievements'][key]
+                    st.rerun()
+                else:
+                    st.warning("The original bullet point seems to have changed. Cannot apply suggestion automatically.")
+            st.divider()
+        except (ValueError, IndexError):
+            continue
+
 def render_skill_gap():
     st.header("🔍 Skill Gap Analysis & Resume Editor")
     if st.button("← Back to Job Details"):
         st.session_state.step = "jd_processed"
         st.rerun()
 
-    # Run the initial, fast analysis only if it hasn't been run for the current resume
+    # --- Initial, Fast Analysis --- 
     if not st.session_state.analysis_results or st.session_state.analysis_results.get('resume_hash') != hash(st.session_state.resume.model_dump_json()):
         with st.spinner("Comparing your resume to the job description..."):
             st.session_state.analysis_results = analysis_agent.analyze(st.session_state.resume, st.session_state.job_description)
             st.session_state.analysis_results['resume_hash'] = hash(st.session_state.resume.model_dump_json())
     
-    analysis_results = st.session_state.analysis_results
-
-    st.metric("Overall Resume Match Score", analysis_results.get('overall_score', 'N/A'))
+    st.metric("Overall Resume Match Score", st.session_state.analysis_results.get('overall_score', 'N/A'))
     st.markdown("--- ")
     st.markdown("### AI-Powered Resume Blueprint")
-    st.markdown("Click the button below to generate a comprehensive, strategic blueprint for optimizing your resume for this specific job.")
 
-    if st.button("✨ Generate Resume Optimization Blueprint", use_container_width=True):
-        resume = st.session_state.resume
-        jd = st.session_state.job_description
-
+    # --- One-Time Blueprint Generation --- 
+    if not st.session_state.get('blueprint_generated'):
         with st.status("Generating your strategic resume blueprint...", expanded=True) as status:
-            # Part 1: Strategic Assessment
+            st.session_state.blueprint_parts = {} # Initialize/reset
+            resume = st.session_state.resume
+            jd = st.session_state.job_description
+
             status.write("Step 1/4: Performing strategic assessment...")
-            assessment = generation_agent.blueprint_step_1_strategic_assessment(resume, jd)
-            st.subheader("1. Strategic Assessment")
-            if 'error' not in assessment:
-                st.markdown(f"* **Position Alignment Score:** {assessment.get('alignment_score', 'N/A')}")
-                st.markdown(f"* **Overall Fitness:** {assessment.get('overall_fitness', 'N/A')}")
-                st.markdown("* **Key Opportunity Areas:**")
-                for opp in assessment.get('key_opportunities', []):
-                    st.markdown(f"  * {opp}")
-            else:
-                st.error(assessment['error'])
-            st.divider()
+            st.session_state.blueprint_parts['assessment'] = generation_agent.blueprint_step_1_strategic_assessment(resume, jd)
 
-            # Part 2: Keyword Table
             status.write("Step 2/4: Analyzing keyword alignment...")
-            keywords = generation_agent.blueprint_step_2_keyword_table(resume, jd)
-            st.subheader("2. Content & Keyword Enhancements")
-            st.markdown("### Keyword Optimization Table")
-            if 'error' not in keywords:
-                for item in keywords:
-                    st.markdown(f"**{item.get('keyword')}**")
-                    col1, col2, col3 = st.columns(3)
-                    found_text = "✅ Found" if item.get('found') else "❌ Missing"
-                    col1.metric("Status", found_text)
-                    col2.metric("Priority", item.get('priority', 'N/A'))
-                    confidence = item.get('confidence', 0)
-                    col3.progress(confidence / 100)
-                    col3.caption(f"Confidence: {confidence}%")
-                    st.warning(f"**Suggested Action:** {item.get('action')}")
-                    st.divider()
-            else:
-                st.error(keywords['error'])
-            st.divider()
+            st.session_state.blueprint_parts['keyword_table'] = generation_agent.blueprint_step_2_keyword_table(resume, jd)
 
-            # Part 3: Recommended Summary
             status.write("Step 3/4: Rewriting professional summary...")
-            summary = generation_agent.blueprint_step_3_summary(resume, jd)
-            st.markdown("### Recommended Professional Summary")
-            st.info(summary)
-            st.divider()
+            st.session_state.blueprint_parts['editable_summary'] = generation_agent.blueprint_step_3_summary(resume, jd)
 
-            # Part 4: Achievement Bullet Points
             status.write("Step 4/4: Rewriting achievement bullet points...")
-            st.markdown("### Achievement-Driven Bullet Points")
-            for work_item in resume.work:
+            st.session_state.blueprint_parts['achievements'] = {}
+            for i, work_item in enumerate(resume.work):
                 if work_item.highlights:
-                    for highlight in work_item.highlights:
+                    for j, highlight in enumerate(work_item.highlights):
+                        unique_key = f"{i}_{j}"
                         result = generation_agent.blueprint_step_4_achievements(highlight, work_item.name, jd)
                         if 'error' not in result:
-                            st.markdown(f"* **Original:** {result['original_bullet']}")
-                            st.success(f"* **Optimized (STAR-D):** {result['optimized_bullet']}")
-                            st.caption(f"**Rationale:** {result['rationale']}")
-                            st.divider()
-                        else:
-                            st.error(result['error'])
+                            st.session_state.blueprint_parts['achievements'][unique_key] = result
             
-            status.update(label="Blueprint generation complete!", state="complete", expanded=False)
+            st.session_state.blueprint_generated = True
+            status.update(label="Blueprint generation complete!", state="complete", expanded=True)
+            st.rerun()
+
+    # --- Display Interactive Blueprint --- 
+    if st.session_state.get('blueprint_generated'):
+        render_blueprint_content()
 
     st.markdown("--- ")
     st.markdown("### 📝 Live Resume Editor")
@@ -333,13 +375,17 @@ def render_skill_gap():
 
         with st.spinner("Generating PDF resume..."):
             try:
-                template_path = os.path.abspath("career_toolkit/typst_templates/resume.typ")
+                source_template_path = os.path.abspath("career_toolkit/typst_templates/resume.typ")
+                # Copy the template into the output folder to ensure it's in the root
+                local_template_path = os.path.join(output_folder, "resume_template.typ")
+                shutil.copy(source_template_path, local_template_path)
+
                 output_pdf_path = os.path.join(output_folder, "resume.pdf")
 
-                # Run the typst compile command, setting the root to the output folder
-                # so it can find resume.json and job_description.json.
+                # Run the typst compile command, setting the root to the output folder.
+                # The input file is now the *copied* template inside the root.
                 process = subprocess.run(
-                    ["typst", "compile", template_path, output_pdf_path, "--root", output_folder],
+                    ["typst", "compile", local_template_path, output_pdf_path, "--root", output_folder],
                     capture_output=True,
                     text=True,
                     check=True
@@ -347,7 +393,7 @@ def render_skill_gap():
                 st.success(f"Successfully generated PDF! View it at: `{output_pdf_path}`")
 
             except FileNotFoundError:
-                st.error(f"Typst template file not found at `{template_path}`.")
+                st.error(f"Typst template file not found at `{source_template_path}`.")
             except subprocess.CalledProcessError as e:
                 st.error(f"Failed to compile Typst resume. Error:\n{e.stderr}")
             except Exception as e:
@@ -376,11 +422,22 @@ def render_cover_letter():
     st.markdown("#### Cover Letter Content")
     if st.button("Generate/Regenerate AI Cover Letter"):
         with st.spinner("Crafting your cover letter..."):
-            st.session_state.cover_letter = generation_agent.generate_cover_letter(
+            # Generate the content
+            cover_letter_content = generation_agent.generate_cover_letter(
                 st.session_state.resume, 
                 st.session_state.job_description, 
                 st.session_state.recipient_name
             )
+            st.session_state.cover_letter = cover_letter_content
+
+            # Save the raw text content to the output folder
+            job_title = st.session_state.job_description.name or "Untitled Job"
+            sanitized_title = "".join(c for c in job_title if c.isalnum() or c in (' ', '_')).rstrip()
+            output_folder = os.path.join("output", sanitized_title)
+            os.makedirs(output_folder, exist_ok=True)
+            with open(os.path.join(output_folder, "cover_letter_content.txt"), "w") as f:
+                f.write(cover_letter_content)
+            st.success(f"Cover letter content saved to `{os.path.join(output_folder, 'cover_letter_content.txt')}`")
 
     st.session_state.cover_letter = st.text_area(
         "Edit the generated cover letter below:", 
@@ -483,29 +540,56 @@ def render_job_tracker():
         job_path = os.path.join(output_dir, job_folder)
         notes = get_job_notes(job_path)
 
-        with st.container():
-            col1, col2, col3, col4 = st.columns([3, 2, 1, 1])
-            col1.subheader(job_folder.replace('_', ' '))
-            col2.metric("Status", notes.get("status", "N/A"))
+        with st.container(border=True):
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                st.subheader(job_folder.replace('_', ' '))
+                st.metric("Status", notes.get("status", "N/A"))
 
-            if col3.button("View / Edit Notes", key=f"notes_{job_folder}"):
-                st.session_state.editing_notes_for = job_folder
-
-            if col4.button("Delete", key=f"delete_{job_folder}"):
+            with col2:
+                st.markdown("**Quick Actions**")
+                if st.button("View / Edit Notes", key=f"notes_{job_folder}", use_container_width=True):
+                    st.session_state.editing_notes_for = job_folder
+                
                 if st.session_state.get(f"confirm_delete_{job_folder}"):
-                    shutil.rmtree(job_path)
-                    st.success(f"Successfully deleted application for {job_folder}.")
-                    st.session_state[f"confirm_delete_{job_folder}"] = False # Reset state
-                    st.rerun()
+                    if st.button("Confirm Deletion", key=f"confirm_btn_{job_folder}", type="primary", use_container_width=True):
+                        shutil.rmtree(job_path)
+                        st.success(f"Successfully deleted application for {job_folder}.")
+                        del st.session_state[f"confirm_delete_{job_folder}"]
+                        st.rerun()
                 else:
-                    st.session_state[f"confirm_delete_{job_folder}"] = True
-                    st.rerun()
-            
-            if st.session_state.get(f"confirm_delete_{job_folder}"):
-                st.error(f"Are you sure? This action is permanent.")
-                st.button("Confirm Deletion", on_click=lambda jf=job_folder: setattr(st.session_state, f"confirm_delete_{jf}", True), key=f"confirm_btn_{job_folder}")
+                    if st.button("Delete Application", key=f"delete_{job_folder}", use_container_width=True):
+                        st.session_state[f"confirm_delete_{job_folder}"] = True
+                        st.rerun()
 
-            st.divider()
+            with st.expander("View Details & Documents"):
+                # Display Job Description
+                st.markdown("**Job Description**")
+                jd_path = os.path.join(job_path, "job_description.json")
+                if os.path.exists(jd_path):
+                    with open(jd_path, 'r') as f:
+                        jd_data = json.load(f)
+                    st.json(jd_data)
+                else:
+                    st.warning("Job description file not found.")
+
+                # Display Document Links
+                st.markdown("**Generated Documents**")
+                doc_col1, doc_col2 = st.columns(2)
+                resume_pdf_path = os.path.join(job_path, "resume.pdf")
+                cover_letter_pdf_path = os.path.join(job_path, "cover_letter.pdf")
+
+                if os.path.exists(resume_pdf_path):
+                    with open(resume_pdf_path, "rb") as f:
+                        doc_col1.download_button("📄 Download Resume PDF", f.read(), file_name="resume.pdf", use_container_width=True)
+                else:
+                    doc_col1.button("📄 Resume PDF Not Found", disabled=True, use_container_width=True)
+                
+                if os.path.exists(cover_letter_pdf_path):
+                    with open(cover_letter_pdf_path, "rb") as f:
+                        doc_col2.download_button("✉️ Download Cover Letter PDF", f.read(), file_name="cover_letter.pdf", use_container_width=True)
+                else:
+                    doc_col2.button("✉️ Cover Letter PDF Not Found", disabled=True, use_container_width=True)
 
     # --- Notes Editing Modal ---
     if 'editing_notes_for' in st.session_state and st.session_state.editing_notes_for:
