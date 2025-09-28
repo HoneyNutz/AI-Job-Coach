@@ -22,7 +22,7 @@ class GenerationAgent:
         """
         try:
             response = openai.chat.completions.create(
-                model="gpt-3.5-turbo",
+                model="gpt-4-turbo-preview",
                 messages=[
                     {"role": "system", "content": "You are an expert career assistant integrated into a Python application. Your responses should be concise and directly usable."}, 
                     {"role": "user", "content": prompt}
@@ -35,11 +35,39 @@ class GenerationAgent:
             print(f"An error occurred while calling the OpenAI API: {e}")
             return f"Error: Could not connect to the generation service. Details: {e}"
 
+    _CONTEXT_LIMIT = 3800 # Characters
+
+    def _summarize_if_needed(self, text: str, context: str = "job description") -> str:
+        """Summarizes text if it exceeds a certain character limit to prevent truncation."""
+        if len(text) <= self._CONTEXT_LIMIT:
+            return text
+
+        print(f"Info: Text for {context} is long ({len(text)} chars). Summarizing to fit context window.")
+        
+        prompt = f"""
+        You are an expert data pre-processor for an AI system. The following text is too long to be processed directly.
+        Your task is to summarize it into a concise version that preserves ALL essential information for analysis.
+        Do not lose any key details, especially named entities, skills, qualifications, responsibilities, and specific requirements.
+        The goal is to reduce the character count while retaining all critical data.
+
+        Context of the text: {context}
+
+        Original Text:
+        ---
+        {text}
+        ---
+
+        Return ONLY the summarized, condensed text.
+        """
+        return self._call_llm(prompt, temperature=0.0, max_tokens=1000) # Low temperature for factual summarization
+
     def extract_job_details(self, raw_text: str) -> Dict:
         """
         Parses raw job description text into a structured dictionary using an LLM,
         conforming to the jsonresume.org/job-description-schema.
         """
+        processed_text = self._summarize_if_needed(raw_text, context="job description")
+
         prompt = f"""
         You are an expert HR analyst. Your task is to meticulously analyze the following job description text and extract the key information, structuring it into a clean JSON object that conforms to the JSON Resume schema for a job description.
 
@@ -62,7 +90,7 @@ class GenerationAgent:
 
         **Job Description Text to Analyze:**
         ---
-        {raw_text[:4000]}
+        {processed_text}
         ---
 
         Now, provide the JSON object. Return only the JSON.
@@ -84,6 +112,23 @@ class GenerationAgent:
             print("Warning: LLM did not return valid JSON for job details. Falling back.")
             return {"description": raw_text} # Fallback
 
+    def _analyze_for_cover_letter(self, resume: Resume, job_description: JobDescription) -> dict:
+        """Analyzes the resume and job description to extract key themes and evidence for the cover letter."""
+        prompt = f"""
+        <Persona> You are an AI Career Strategist. Your task is to find the strongest narrative threads between a resume and a job description. </Persona>
+        <Input_Data>
+        - Resume: {resume.model_dump_json(indent=2)}
+        - Job Description: {job_description.model_dump_json(indent=2)}
+        </Input_Data>
+        <Instructions>
+        1.  **Identify Core Themes:** From the job description, identify the 3 most critical themes (e.g., 'Data-Driven Decision Making', 'Cross-Functional Leadership', 'Cloud Infrastructure Management').
+        2.  **Find STAR-D Evidence:** For each theme, scan the resume for the single strongest piece of evidence. This should be a quantified achievement.
+        3.  **Synthesize:** Create a "story point" for each theme.
+        4.  **Output:** Return a JSON object with a single key, `story_points`, which is a list of objects. Each object in the list should have two keys: `theme` (string) and `evidence` (a string describing the specific, quantified achievement from the resume that supports the theme). Return ONLY the JSON object.
+        </Instructions>
+        """
+        return self._call_llm_with_json_retry(prompt)
+
     def generate_cover_letter(self, resume: Resume, job_description: JobDescription, recipient_name: str) -> str:
         """
         Generates a personalized cover letter based on the resume, job description, and a new strategic prompt.
@@ -91,50 +136,33 @@ class GenerationAgent:
         resume_json = resume.model_dump_json(indent=2)
         job_description_json = job_description.model_dump_json(indent=2)
 
+        # Step 1: Perform the analysis to get the story points.
+        story_points_data = self._analyze_for_cover_letter(resume, job_description)
+        if 'error' in story_points_data:
+            return f"Error during analysis phase: {story_points_data['error']}"
+
         prompt = f"""
-        <Persona> You are an AI Career Communications Expert. Your function is to synthesize a user's professional history with a company's specific needs to create a compelling narrative. You are a master of tone, persuasion, and brevity, crafting messages that resonate with hiring managers. </Persona>
-        <Context> A cover letter's purpose is to bridge the gap between the structured facts of a resume and the human needs of a job description. It must be a concise, powerful story that demonstrates alignment and generates excitement. The user will provide their resume and a target job description in JSON format. </Context>
-        <Goal> To generate a substantive, passionate, and highly-targeted cover letter (approximately 300 words) that showcases the user's technical skills, leadership, and ability to manage complexity, directly aligning them with the target role. </Goal>
+        <Persona> You are an AI Career Communications Expert. Your task is to write a compelling cover letter narrative based on pre-analyzed story points. </Persona>
+        <Goal> To write a passionate and highly-targeted cover letter (approx. 300 words) that weaves the provided story points into a seamless and persuasive narrative. </Goal>
         <Input_Data>
-        - Resume: {resume_json}
-        - Job Description: {job_description_json}
+        - Story Points: {json.dumps(story_points_data, indent=2)}
         - User Name: {resume.basics.name}
-        - Hiring Manager Name: {recipient_name}
         - Company Name: {job_description.hiringOrganization}
         - Job Title: {job_description.name}
         </Input_Data>
-        <Methodology> Follow this three-step process precisely.
-        **Step 1: Thematic Analysis & Keyword Extraction**
-        1. **Identify Core Requirements:** From the `[job_description_json]`, extract the top 3-4 most critical requirements.
-        2. **Scan for Evidence:** From the `[resume_json]`, identify specific projects, skills, or accomplishments that provide direct evidence for the requirements identified above.
-        3. **Map to Core Themes:** Categorize the evidence under the three mandated themes:
-        * **Technical Capabilities:** (e.g., specific programming languages, software, or technical achievements).
-        * **Leadership Abilities:** (e.g., mentions of leading teams, mentoring, project management).
-        * **Handling Complexity:** (e.g., roles involving large-scale projects, multi-faceted problems, or significant responsibility).
-        **Step 2: Narrative Construction (3-Paragraph Structure)**
-        1. **Paragraph 1: The Hook (Approx. 60 words):**
-        * Start with authentic enthusiasm for the `[Job Title]` role at `[Company Name]`.
-        * Immediately connect your core value proposition to 1-2 of the most critical requirements from the job description, establishing your fitness for the role with confidence.
-        2. **Paragraph 2: The Proof (Approx. 180 words):**
-        * This is the core of the letter. Weave the evidence from Step 1.3 into a compelling, detailed narrative.
-        * Construct 3-4 powerful sentences or a short paragraph for each of the core themes (Technical, Leadership, Complexity). Each sentence must link a required skill (from the job) to a specific, quantified accomplishment (from the resume).
-        * **Example Structure:** "My experience in [Technical Skill from Resume] directly addresses your need for [Requirement from Job Description], a capability I demonstrated when I led [Project from Resume] to achieve a [Quantified Result from Resume], which involved navigating [specific complexity]."
-        3. **Paragraph 3: The Closing (Approx. 60 words):**
-        * Reiterate your strong, specific interest in the company's mission or a recent project.
-        * Express confidence in your ability to deliver value and contribute to the team's goals.
-        * Provide a clear and proactive call to action, suggesting a discussion about how your skills can benefit the company.
-        **Step 3: Tone & Polish**
-        1. Review the entire draft to ensure it maintains a **pleasant, passionate, and professional** tone throughout.
-        2. Verify the final word count is **under 200 words.** Edit for brevity and impact.
+        <Methodology>
+        1.  **The Hook:** Start with a powerful opening paragraph that expresses genuine enthusiasm for the role and company. Briefly introduce the core themes from the story points as the foundation of your fitness for the role.
+        2.  **The Proof:** In the body of the letter (1-2 paragraphs), dedicate a few sentences to each `story_point`. Seamlessly weave the `theme` and its corresponding `evidence` into a compelling narrative. Show, don't just tell. Connect your past achievements directly to the company's needs.
+        3.  **The Closing:** Conclude with a confident closing paragraph that reiterates your interest, summarizes your value proposition, and includes a clear call to action.
         </Methodology>
         <Constraints>
-        - **Strict 300-word approximation.** Aim for this length to provide substance without being verbose.
-        - **Evidence-Based:** Every claim made in the cover letter must be directly supported by the provided `[resume_json]`. Do not invent or infer details.
-        - **Maintain specified tone:** The voice must be passionate and pleasant, not generic or robotic.
+        - **Strict 300-word approximation.**
+        - **Narrative Flow:** Do not just list the story points. You must connect them into a fluid, well-written letter.
+        - **Tone:** Maintain a pleasant, passionate, and professional tone.
         </Constraints>
-        <Output_Format> Generate ONLY the body text of the cover letter. Do NOT include the salutation (e.g., 'Dear...'), the closing (e.g., 'Sincerely,...'), or the user's name at the end. The output should start with the first sentence of the first paragraph and end with the last sentence of the final paragraph. </Output_Format>
+        <Output_Format> Generate ONLY the body text of the cover letter. Do NOT include salutations or closings. </Output_Format>
         """
-        return self._call_llm(prompt, temperature=0.7, max_tokens=400)
+        return self._call_llm(prompt, temperature=0.7, max_tokens=600)
 
     def _call_llm_with_json_retry(self, prompt: str, max_retries=2) -> dict:
         """Calls the LLM and retries if the output is not valid JSON, asking the LLM to fix it."""
@@ -226,7 +254,7 @@ class GenerationAgent:
         <Instructions>
         1.  Rewrite the provided bullet point using the **STAR-D (Situation, Task, Action, Result, Detail)** method.
         2.  Focus on transforming passive duties into active, quantified achievements.
-        3.  Where numbers are not present, instruct the user on what to find (e.g., "Increased efficiency by X%," "Managed a budget of $Y").
+        3.  **Crucially, if a specific metric is missing, invent a plausible and specific placeholder metric to make the achievement tangible.** Frame it clearly as a placeholder (e.g., "...resulting in a [~15-20%] reduction in processing time," or "...managing a project budget of [approx. $250,000]"). This gives the user a concrete template to edit.
         4.  Provide a concise rationale for *why* the change was made, referencing either ATS optimization or recruitment psychology.
         5.  **Output:** Return a JSON object with three keys: `original_bullet` (string), `optimized_bullet` (string), and `rationale` (string). Return ONLY the JSON object.
         </Instructions>

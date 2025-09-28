@@ -39,11 +39,14 @@ def initialize_session_state():
         # Load Signature
         st.session_state.signature_content = None
         st.session_state.signature_filename = ""
-        sig_path = os.path.join(USER_ASSETS_DIR, "signature.png")
-        if os.path.exists(sig_path):
-            with open(sig_path, "rb") as f:
-                st.session_state.signature_content = f.read()
-            st.session_state.signature_filename = "signature.png"
+        if os.path.exists(USER_ASSETS_DIR):
+            for f in os.listdir(USER_ASSETS_DIR):
+                if f.lower().endswith(('.png', '.jpg', '.jpeg', '.svg')):
+                    sig_path = os.path.join(USER_ASSETS_DIR, f)
+                    with open(sig_path, "rb") as file:
+                        st.session_state.signature_content = file.read()
+                    st.session_state.signature_filename = f
+                    break # Load the first one found
         
         st.session_state.assets_loaded = True
 
@@ -99,19 +102,20 @@ def render_settings():
 
     # --- Signature Upload ---
     st.subheader("2. Your Signature")
-    signature_uploader = st.file_uploader("Upload your signature image (PNG format recommended)", type=["png", "jpg", "jpeg", "svg"])
+    signature_uploader = st.file_uploader("Upload your signature image (PNG, JPG, SVG)", type=["png", "jpg", "jpeg", "svg"])
     if signature_uploader is not None:
-        # Standardize filename to signature.png
-        new_filename = "signature.png"
-        
-        # Save to session state
+        # Clear any old signature files first
+        if os.path.exists(USER_ASSETS_DIR):
+            for f in os.listdir(USER_ASSETS_DIR):
+                if f.lower().endswith(('.png', '.jpg', '.jpeg', '.svg')):
+                    os.remove(os.path.join(USER_ASSETS_DIR, f))
+
+        # Save new signature with its original name
         st.session_state.signature_content = signature_uploader.read()
-        st.session_state.signature_filename = new_filename
-        
-        # Save new signature persistently
-        with open(os.path.join(USER_ASSETS_DIR, new_filename), "wb") as f:
+        st.session_state.signature_filename = signature_uploader.name
+        with open(os.path.join(USER_ASSETS_DIR, signature_uploader.name), "wb") as f:
             f.write(st.session_state.signature_content)
-        st.success(f"Signature updated and saved as '{new_filename}'!")
+        st.success(f"Signature '{signature_uploader.name}' uploaded and saved!")
     
     if st.session_state.signature_content:
         st.markdown("**Current Signature:**")
@@ -462,11 +466,9 @@ def render_cover_letter():
                 output_typ_path = os.path.join(output_folder, "cover_letter.typ")
                 output_pdf_path = os.path.join(output_folder, "cover_letter.pdf")
 
-                # Save the user-uploaded signature if it exists
+                # Save the user-uploaded signature directly into the output folder
                 if st.session_state.signature_content and st.session_state.signature_filename:
-                    graphics_dest = os.path.join(output_folder, "graphics")
-                    os.makedirs(graphics_dest, exist_ok=True)
-                    signature_path = os.path.join(graphics_dest, st.session_state.signature_filename)
+                    signature_path = os.path.join(output_folder, st.session_state.signature_filename)
                     with open(signature_path, "wb") as f:
                         f.write(st.session_state.signature_content)
 
@@ -482,7 +484,7 @@ def render_cover_letter():
                 # Dynamically add the signature image to the template if it exists
                 signature_typst_code = ""
                 if st.session_state.signature_content and st.session_state.signature_filename:
-                    signature_typst_code = f'#image("graphics/{escape_typst_string(st.session_state.signature_filename)}", width: 150pt)\n#v(-1em)'
+                    signature_typst_code = f'#image("{escape_typst_string(st.session_state.signature_filename)}", width: 150pt)\n#v(-1em)'
                 
                 # Replace placeholders in the template
                 replacements = {
@@ -569,7 +571,24 @@ def render_job_tracker():
                 if os.path.exists(jd_path):
                     with open(jd_path, 'r') as f:
                         jd_data = json.load(f)
-                    st.json(jd_data)
+                    
+                    st.markdown(f"**Company:** {jd_data.get('hiringOrganization', 'N/A')}")
+                    st.markdown(f"**Location:** {jd_data.get('jobLocation', 'N/A')}")
+                    if jd_data.get('url'):
+                        st.markdown(f"[View Original Posting]({jd_data.get('url')})")
+                    
+                    if jd_data.get('description'):
+                        st.markdown(f"**Description:**\n{jd_data.get('description')}")
+
+                    if jd_data.get('responsibilities'):
+                        st.markdown("**Responsibilities:**")
+                        for resp in jd_data.get('responsibilities'):
+                            st.markdown(f"- {resp}")
+
+                    if jd_data.get('qualifications'):
+                        st.markdown("**Qualifications:**")
+                        for qual in jd_data.get('qualifications'):
+                            st.markdown(f"- {qual}")
                 else:
                     st.warning("Job description file not found.")
 
