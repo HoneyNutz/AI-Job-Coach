@@ -1,9 +1,9 @@
-import openai
 import os
 import json
 from .data_agent import Resume, JobDescription
 from pydantic import HttpUrl
 from typing import Dict, List, Optional
+from openai import OpenAI
 
 class GenerationAgent:
     def __init__(self, api_key: str = None):
@@ -14,28 +14,78 @@ class GenerationAgent:
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
             raise ValueError("OpenAI API key not provided. Please set it as an environment variable 'OPENAI_API_KEY'.")
-        openai.api_key = self.api_key
+        # Ensure the SDK can find the API key and initialize a client
+        os.environ["OPENAI_API_KEY"] = self.api_key
+        self.client = OpenAI()
+        # Allow overriding via env, default to gpt-5-mini per current configuration
+        self.model_name = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
     def _call_llm(self, prompt: str, temperature: float = 0.5, max_tokens: int = 1500) -> str:
         """
-        Private method to handle calls to the OpenAI ChatCompletion API.
+        Private method to handle calls to OpenAI API with automatic fallback.
         """
         try:
-            response = openai.chat.completions.create(
-                model="gpt-4-turbo-preview",
+            # Try Responses API first for reasoning models
+            if self.model_name.startswith("gpt-5") or self.model_name.startswith("o4"):
+                try:
+                    kwargs = {
+                        "model": self.model_name,
+                        "input": [
+                            {"role": "system", "content": "You are an expert career assistant. Provide precise, structured responses."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "max_output_tokens": max_tokens,
+                        "reasoning": {"effort": "medium"}
+                    }
+                    response = self.client.responses.create(**kwargs)
+                    return getattr(response, "output_text", "").strip()
+                except Exception as e:
+                    print(f"Responses API failed, falling back to Chat Completions: {e}")
+                    # Fall through to chat completions
+            
+            # Use Chat Completions API as fallback or for non-reasoning models
+            response = self.client.chat.completions.create(
+                model="gpt-4-turbo-preview",  # Reliable fallback model
                 messages=[
-                    {"role": "system", "content": "You are an expert career assistant integrated into a Python application. Your responses should be concise and directly usable."}, 
+                    {"role": "system", "content": "You are an expert career assistant. Provide precise, structured responses."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=temperature,
                 max_tokens=max_tokens
             )
             return response.choices[0].message.content.strip()
+            
         except Exception as e:
             print(f"An error occurred while calling the OpenAI API: {e}")
             return f"Error: Could not connect to the generation service. Details: {e}"
 
-    _CONTEXT_LIMIT = 3800 # Characters
+    def _extract_json_object(self, text: str) -> str:
+        """Best-effort extraction of the first top-level JSON object from a text response."""
+        if not text:
+            return ""
+        # Quick path: already clean
+        s = text.strip()
+        if s.startswith('{') and s.endswith('}'):
+            return s
+        # Remove common markdown fences
+        if s.startswith('```'):
+            s = s.strip('`')
+        # Find first '{' and attempt to parse balanced braces
+        start = s.find('{')
+        if start == -1:
+            return ""
+        depth = 0
+        for i in range(start, len(s)):
+            if s[i] == '{':
+                depth += 1
+            elif s[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    candidate = s[start:i+1]
+                    return candidate
+        return ""
+
+    _CONTEXT_LIMIT = 6000 # Characters
 
     def _summarize_if_needed(self, text: str, context: str = "job description") -> str:
         """Summarizes text if it exceeds a certain character limit to prevent truncation."""
@@ -59,7 +109,8 @@ class GenerationAgent:
 
         Return ONLY the summarized, condensed text.
         """
-        return self._call_llm(prompt, temperature=0.0, max_tokens=1000) # Low temperature for factual summarization
+        # Low temperature for factual summarization, slightly higher token budget for fidelity
+        return self._call_llm(prompt, temperature=0.0, max_tokens=2000)
 
     def extract_job_details(self, raw_text: str) -> Dict:
         """
@@ -69,48 +120,140 @@ class GenerationAgent:
         processed_text = self._summarize_if_needed(raw_text, context="job description")
 
         prompt = f"""
-        You are an expert HR analyst. Your task is to meticulously analyze the following job description text and extract the key information, structuring it into a clean JSON object that conforms to the JSON Resume schema for a job description.
+        You are an expert HR analyst. Analyze the job description and return a STRICT JSON object that conforms to this schema and types:
 
-        **Instructions:**
-        1.  **Read the entire text carefully** to understand the context of the role, the company, and the ideal candidate.
-        2.  **Synthesize information**: The required details might be spread across different sections. Combine related points into a coherent whole for each field.
-        3.  **Be comprehensive**: Extract all relevant details for each field.
-        4.  **Format correctly**: For fields like 'responsibilities' and 'qualifications', combine the points into a single, well-structured string. You can use newline characters (\\n) to separate bullet points or different thoughts. For 'skills', provide a comma-separated list.
+        Required keys and types:
+        - name: string (job title)
+        - hiringOrganization: string (company)
+        - jobLocation: string
+        - description: string (1-3 sentences)
+        - responsibilities: array of strings (each a distinct duty)
+        - qualifications: array of strings (each a distinct qualification)
+        - skills: string (comma-separated list of skills, e.g., "Python, React, Agile")
+        - educationRequirements: array of strings
+        - experienceRequirements: array of strings
+        - originalText: string (the full original job description text; include as-is, unmodified)
 
-        **JSON Schema Fields to Populate:**
-        - `name`: The job title.
-        - `hiringOrganization`: The name of the company.
-        - `jobLocation`: The location of the job.
-        - `description`: A brief, engaging summary of the company or the role's purpose.
-        - `responsibilities`: A JSON array of strings, where each string is a distinct duty or responsibility.
-        - `qualifications`: A JSON array of strings, where each string is a distinct qualification.
-        - `skills`: A comma-separated string of the most important technical and soft skills mentioned (e.g., "Python, React, Project Management, Agile").
-        - `educationRequirements`: A JSON array of strings describing the required education.
-        - `experienceRequirements`: A JSON array of strings describing the required experience.
+        Rules:
+        - Combine scattered bullets into unified arrays for responsibilities and qualifications.
+        - If bullets are not explicitly present, infer 5-10 concise items from the prose.
+        - Preserve important named entities and specific tools in responsibilities/qualifications where appropriate.
+        - The output MUST be valid JSON and contain ALL required keys. Avoid leaving arrays empty unless absolutely no information exists; infer items when possible from the text.
 
-        **Job Description Text to Analyze:**
+        Job Description Text to Analyze (variable length):
         ---
         {processed_text}
         ---
 
-        Now, provide the JSON object. Return only the JSON.
+        Full Original Text (do not modify; place into originalText):
+        ---
+        {raw_text}
+        ---
+
+        Return ONLY the JSON object.
         """
-        response_str = self._call_llm(prompt)
+        # Use the JSON retry helper with a higher token budget and low temperature for structure fidelity
+        response_obj = self._call_llm_with_json_retry(prompt, max_retries=2, temperature=0.2, max_tokens=4000)
+        response_str = json.dumps(response_obj) if isinstance(response_obj, dict) else str(response_obj)
         try:
             if response_str.startswith('```json'):
                 response_str = response_str[7:-4].strip()
             data = json.loads(response_str)
 
-            # Post-process fields that should be lists but might be strings
+            # Normalize and guarantee required keys/types
+            def ensure_list(value):
+                if value is None:
+                    return []
+                if isinstance(value, list):
+                    # Coerce all items to strings, strip empties
+                    return [str(x).strip() for x in value if str(x).strip()]
+                if isinstance(value, str):
+                    parts = [p.strip() for p in value.replace('\r', '\n').split('\n') if p.strip()]
+                    # Fallback: also split on semicolons if present
+                    if len(parts) <= 1 and ';' in value:
+                        parts = [p.strip() for p in value.split(';') if p.strip()]
+                    return parts
+                return [str(value).strip()]
+
+            data.setdefault('name', '')
+            data.setdefault('hiringOrganization', '')
+            data.setdefault('jobLocation', '')
+            data.setdefault('description', '')
+            data.setdefault('responsibilities', [])
+            data.setdefault('qualifications', [])
+            data.setdefault('skills', '')
+            data.setdefault('educationRequirements', [])
+            data.setdefault('experienceRequirements', [])
+            data.setdefault('originalText', raw_text)
+
+            # Coerce list-typed fields
             for field in ['responsibilities', 'qualifications', 'educationRequirements', 'experienceRequirements']:
-                if field in data and isinstance(data[field], str):
-                    # Split by newline and filter out empty strings
-                    data[field] = [item.strip() for item in data[field].split('\n') if item.strip()]
-            
+                data[field] = ensure_list(data.get(field))
+
+            # Ensure skills is a comma-separated string
+            if isinstance(data.get('skills'), list):
+                data['skills'] = ', '.join([s for s in data['skills'] if s])
+            elif not isinstance(data.get('skills'), str):
+                data['skills'] = str(data['skills']) if data.get('skills') else ''
+
+            # Heuristic fallback: if responsibilities/qualifications empty, infer from processed text lines
+            if not data['responsibilities'] or not data['qualifications']:
+                lines = [ln.strip(' •-*\t') for ln in processed_text.split('\n') if ln.strip()]
+                bullets = [ln for ln in lines if len(ln) > 5]
+                # Split heuristically into two halves if needed
+                if not data['responsibilities'] and bullets:
+                    data['responsibilities'] = bullets[: min(8, len(bullets))]
+                if not data['qualifications'] and bullets:
+                    data['qualifications'] = bullets[min(8, len(bullets)) : min(16, len(bullets))]
+
+            # Second-pass recovery: if still empty, run focused extraction against originalText
+            if (not data['responsibilities'] or not data['qualifications']) and raw_text:
+                if not data['responsibilities']:
+                    resp_prompt = f"""
+                    Extract 8-12 distinct job responsibilities from the job description below.
+                    Return ONLY a valid JSON object of the form: {{"items": ["resp1", "resp2", ...]}}.
+                    Do not include any other keys.
+
+                    Job Description:
+                    ---
+                    {raw_text}
+                    ---
+                    """
+                    resp_obj = self._call_llm_with_json_retry(resp_prompt, max_retries=2, temperature=0.2, max_tokens=1200)
+                    if isinstance(resp_obj, dict) and isinstance(resp_obj.get('items'), list):
+                        data['responsibilities'] = [str(x).strip() for x in resp_obj['items'] if str(x).strip()]
+
+                if not data['qualifications']:
+                    qual_prompt = f"""
+                    Extract 8-12 distinct candidate qualifications or requirements from the job description below (skills, experience, certifications).
+                    Return ONLY a valid JSON object of the form: {{"items": ["qual1", "qual2", ...]}}.
+                    Do not include any other keys.
+
+                    Job Description:
+                    ---
+                    {raw_text}
+                    ---
+                    """
+                    qual_obj = self._call_llm_with_json_retry(qual_prompt, max_retries=2, temperature=0.2, max_tokens=1200)
+                    if isinstance(qual_obj, dict) and isinstance(qual_obj.get('items'), list):
+                        data['qualifications'] = [str(x).strip() for x in qual_obj['items'] if str(x).strip()]
+
             return data
         except (json.JSONDecodeError, TypeError):
             print("Warning: LLM did not return valid JSON for job details. Falling back.")
-            return {"description": raw_text} # Fallback
+            # Return a minimally valid structure while preserving the original text
+            return {
+                "name": "",
+                "hiringOrganization": "",
+                "jobLocation": "",
+                "description": "",
+                "responsibilities": [],
+                "qualifications": [],
+                "skills": "",
+                "educationRequirements": [],
+                "experienceRequirements": [],
+                "originalText": raw_text,
+            }
 
     def _analyze_for_cover_letter(self, resume: Resume, job_description: JobDescription) -> dict:
         """Analyzes the resume and job description to extract key themes and evidence for the cover letter."""
@@ -164,65 +307,120 @@ class GenerationAgent:
         """
         return self._call_llm(prompt, temperature=0.7, max_tokens=600)
 
-    def _call_llm_with_json_retry(self, prompt: str, max_retries=2) -> dict:
-        """Calls the LLM and retries if the output is not valid JSON, asking the LLM to fix it."""
-        current_prompt = prompt
+    def _call_llm_with_json_retry(self, prompt: str, max_retries=3, temperature: float = 0.3, max_tokens: int = 2000) -> dict:
+        """Calls the LLM with robust JSON parsing and retry logic."""
+        # Enhance prompt to be more explicit about JSON requirements
+        json_prompt = f"""{prompt}
+        
+CRITICAL: Your response must be ONLY valid JSON. No explanations, no markdown, no extra text.
+        Start with {{ and end with }}. Ensure all strings are properly quoted and escaped."""
+        
         for attempt in range(max_retries):
-            response_str = self._call_llm(current_prompt, temperature=0.5)
-            try:
-                # Clean the response string of markdown fences
-                if response_str.startswith('```json'):
-                    response_str = response_str[7:-4].strip()
-                return json.loads(response_str)
-            except json.JSONDecodeError:
-                print(f"Warning: LLM returned invalid JSON on attempt {attempt + 1}.")
-                current_prompt = f"""
-                Your previous response was not valid JSON. Please fix it.
-                PREVIOUS INVALID RESPONSE:
-                ---
-                {response_str}
-                ---
-                Return ONLY the corrected, valid JSON object.
-                """
-        return {"error": f"Failed to get valid JSON after {max_retries} attempts."}
+            response_str = self._call_llm(json_prompt, temperature=temperature, max_tokens=max_tokens)
+            
+            # Skip if we got an error from the API
+            if response_str.startswith("Error:"):
+                print(f"API error on attempt {attempt + 1}: {response_str}")
+                continue
+                
+            # Multiple parsing strategies
+            for strategy in [self._parse_json_direct, self._parse_json_extract, self._parse_json_fix]:
+                try:
+                    result = strategy(response_str)
+                    if result and isinstance(result, dict) and "error" not in result:
+                        return result
+                except Exception as e:
+                    continue
+            
+            # Log failure details
+            preview = (response_str or "")[:300].replace('\n', ' ')
+            print(f"JSON parse failed attempt {attempt + 1}. Preview: {preview}")
+            
+            # Update prompt for retry
+            json_prompt = f"""Fix this invalid JSON and return ONLY the corrected JSON:
+            {response_str[:1000]}
+            
+            Requirements:
+            - Must be valid JSON starting with {{ and ending with }}
+            - All strings must be quoted
+            - No trailing commas
+            - No comments or explanations"""
+        
+        return {"error": f"Failed to get valid JSON after {max_retries} attempts"}
+    
+    def _parse_json_direct(self, text: str) -> dict:
+        """Direct JSON parsing after basic cleanup."""
+        cleaned = text.strip()
+        if cleaned.startswith('```json'):
+            cleaned = cleaned[7:]
+        if cleaned.startswith('```'):
+            cleaned = cleaned[3:]
+        if cleaned.endswith('```'):
+            cleaned = cleaned[:-3]
+        return json.loads(cleaned.strip())
+    
+    def _parse_json_extract(self, text: str) -> dict:
+        """Extract JSON object using brace matching."""
+        extracted = self._extract_json_object(text)
+        if extracted:
+            return json.loads(extracted)
+        raise json.JSONDecodeError("No JSON object found", text, 0)
+    
+    def _parse_json_fix(self, text: str) -> dict:
+        """Attempt to fix common JSON issues."""
+        import re
+        # Remove common issues
+        fixed = text.strip()
+        # Remove trailing commas
+        fixed = re.sub(r',\s*}', '}', fixed)
+        fixed = re.sub(r',\s*]', ']', fixed)
+        # Try to extract just the JSON part
+        match = re.search(r'\{.*\}', fixed, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        raise json.JSONDecodeError("Could not fix JSON", text, 0)
 
     def blueprint_step_1_strategic_assessment(self, resume: Resume, job_description: JobDescription):
-        """Generates the strategic assessment part of the blueprint, including score, fitness, and opportunities."""
-        prompt = f"""
-        <Persona> You are an AI Career Strategist. </Persona>
-        <Task> Analyze the resume and job description to perform a strategic assessment. </Task>
-        <Input_Data>
-        - Resume: {resume.model_dump_json(indent=2)}
-        - Job Description: {job_description.model_dump_json(indent=2)}
-        </Input_Data>
-        <Instructions>
-        1. **Keyword Mapping:** Scrutinize the job description. Extract the top 15-20 hard skills, soft skills, and technical qualifications. Calculate a 'Keyword Alignment Score' representing the percentage of these keywords present in the resume.
-        2. **Experience Gap Identification:** Compare the job's core responsibilities against the resume's work history. Identify the top 3 areas where the user's experience is weakest or poorly communicated.
-        3. **Initial Verdict:** Provide a one-sentence summary of the resume's current fitness for the role.
-        4. **Output:** Return a JSON object with three keys: `alignment_score` (string percentage), `overall_fitness` (string), and `key_opportunities` (a list of 3 strings). Return ONLY the JSON object.
-        </Instructions>
-        """
-        return self._call_llm_with_json_retry(prompt)
+        """Generates the strategic assessment part of the blueprint."""
+        prompt = f"""Analyze this resume against the job description and return a strategic assessment.
+        
+Resume Summary: {resume.basics.summary or 'No summary'}
+Resume Skills: {', '.join(resume.skills) if resume.skills else 'No skills listed'}
+Work Experience: {len(resume.work)} positions
+        
+Job Requirements: {', '.join(job_description.responsibilities[:5]) if job_description.responsibilities else 'No requirements listed'}
+Required Skills: {job_description.skills or 'No skills specified'}
+        
+Analyze keyword alignment and identify gaps. Return JSON with exactly these keys:
+{{
+  "alignment_score": "XX%",
+  "overall_fitness": "one sentence assessment",
+  "key_opportunities": ["opportunity 1", "opportunity 2", "opportunity 3"]
+}}"""
+        return self._call_llm_with_json_retry(prompt, temperature=0.2, max_tokens=1000)
 
     def blueprint_step_2_keyword_table(self, resume: Resume, job_description: JobDescription):
         """Generates the keyword optimization table as a JSON array."""
-        prompt = f"""
-        <Persona> You are an AI Career Strategist. </Persona>
-        <Task> Create a keyword optimization analysis. </Task>
-        <Input_Data>
-        - Resume: {resume.model_dump_json(indent=2)}
-        - Job Description: {job_description.model_dump_json(indent=2)}
-        </Input_Data>
-        <Instructions>
-        1.  Extract the top 15 most important keywords/skills from the job description.
-        2.  For each keyword, determine if it's present in the resume (boolean true/false).
-        3.  Assign a priority ('High', 'Medium', 'Low') based on its importance.
-        4.  Provide a specific, actionable suggestion for where and how to include the keyword.
-        5.  Calculate a confidence score (0-100) for each keyword based on how well the resume currently represents that skill.
-        6.  **Output:** Return a JSON array where each object has keys: `keyword` (string), `found` (boolean), `priority` (string), `confidence` (integer), and `action` (string). Return ONLY the JSON array.
-        </Instructions>
-        """
-        return self._call_llm_with_json_retry(prompt)
+        # Extract key info to avoid token bloat
+        resume_text = f"{resume.basics.summary or ''} {' '.join(resume.skills or [])} {' '.join([w.name + ' ' + ' '.join(w.highlights or []) for w in resume.work[:3]])}"
+        job_keywords = f"{job_description.skills or ''} {' '.join(job_description.responsibilities[:10]) if job_description.responsibilities else ''}"
+        
+        prompt = f"""Extract 8-12 key skills/keywords from this job description and check if they appear in the resume.
+        
+Job Keywords: {job_keywords[:1000]}
+Resume Content: {resume_text[:1000]}
+        
+Return a JSON array with this exact structure:
+[
+  {{
+    "keyword": "specific skill or technology",
+    "found": true or false,
+    "priority": "High" or "Medium" or "Low",
+    "confidence": 0-100 integer,
+    "action": "specific suggestion for improvement"
+  }}
+]"""
+        return self._call_llm_with_json_retry(prompt, temperature=0.2, max_tokens=1800)
 
     def blueprint_step_3_summary(self, resume: Resume, job_description: JobDescription):
         """Rewrites the professional summary."""
@@ -239,7 +437,7 @@ class GenerationAgent:
         3.  **Output:** Return only the rewritten summary as a single string.
         </Instructions>
         """
-        return self._call_llm(prompt, max_tokens=500)
+        return self._call_llm(prompt, max_tokens=700)
 
     def blueprint_step_4_achievements(self, highlight: str, work_title: str, job_description: JobDescription):
         """Rewrites a single work experience highlight using the STAR-D method."""

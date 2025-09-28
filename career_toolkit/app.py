@@ -52,7 +52,17 @@ def initialize_session_state():
 
     # Set initial step based on whether assets are present
     if 'step' not in st.session_state:
-        if os.path.exists(os.path.join(USER_ASSETS_DIR, "resume.json")):
+        has_resume_file = os.path.exists(os.path.join(USER_ASSETS_DIR, "resume.json"))
+        # Determine if a signature image exists in user assets
+        has_signature_file = False
+        if os.path.exists(USER_ASSETS_DIR):
+            for f in os.listdir(USER_ASSETS_DIR):
+                if f.lower().endswith((".png", ".jpg", ".jpeg", ".svg")):
+                    has_signature_file = True
+                    break
+
+        # If either a resume or a signature exists, don't start on Settings
+        if has_resume_file or has_signature_file:
             st.session_state.step = "enter_jd"
         else:
             st.session_state.step = "settings"
@@ -178,6 +188,12 @@ def render_enter_jd():
             st.session_state.added_skills = list(inferred_skills - original_skills)
             extracted_data['skills'] = ", ".join(all_skills)
             
+            # Preserve full original JD text separately if provided by generator
+            if 'originalText' in extracted_data:
+                st.session_state.job_description_full_text = extracted_data.get('originalText')
+                # Remove from dict to avoid validation issues if model forbids extras
+                extracted_data.pop('originalText', None)
+
             if jd_link:
                 extracted_data['url'] = jd_link
             st.session_state.job_description = JobDescription(**extracted_data)
@@ -210,6 +226,11 @@ def render_blueprint_content():
     keywords = st.session_state.blueprint_parts.get('keyword_table', [])
 
     st.subheader("1. Strategic Assessment")
+    if st.button("Rerun Strategic Assessment", key="rerun_assessment"):
+        with st.spinner("Re-running strategic assessment..."):
+            st.session_state.blueprint_parts['assessment'] = generation_agent.blueprint_step_1_strategic_assessment(resume, st.session_state.job_description)
+            st.success("Strategic assessment updated.")
+            st.rerun()
     if 'error' not in assessment:
         st.markdown(f"* **Position Alignment Score:** {assessment.get('alignment_score', 'N/A')}")
         st.markdown(f"* **Overall Fitness:** {assessment.get('overall_fitness', 'N/A')}")
@@ -222,6 +243,11 @@ def render_blueprint_content():
 
     st.subheader("2. Content & Keyword Enhancements")
     st.markdown("### Keyword Optimization Table")
+    if st.button("Rerun Keyword Optimization Table", key="rerun_keywords"):
+        with st.spinner("Re-running keyword analysis..."):
+            st.session_state.blueprint_parts['keyword_table'] = generation_agent.blueprint_step_2_keyword_table(resume, st.session_state.job_description)
+            st.success("Keyword table updated.")
+            st.rerun()
     if isinstance(keywords, list):
         for item in keywords:
             st.markdown(f"**{item.get('keyword')}**")
@@ -239,6 +265,11 @@ def render_blueprint_content():
     st.divider()
 
     st.markdown("### Recommended Professional Summary")
+    if st.button("Regenerate Summary", key="rerun_summary"):
+        with st.spinner("Re-generating professional summary..."):
+            st.session_state.blueprint_parts['editable_summary'] = generation_agent.blueprint_step_3_summary(resume, st.session_state.job_description)
+            st.success("Summary updated.")
+            st.rerun()
     edited_summary = st.text_area("Edit the AI-generated summary below:", value=st.session_state.blueprint_parts.get('editable_summary', ''), height=150, key="editable_summary_area")
     if st.button("Update Resume Summary"):
         st.session_state.resume.basics.summary = edited_summary
@@ -247,6 +278,18 @@ def render_blueprint_content():
     st.divider()
 
     st.markdown("### Achievement-Driven Bullet Points")
+    if st.button("Rerun Achievement Suggestions", key="rerun_achievements"):
+        with st.spinner("Re-running achievement suggestions..."):
+            st.session_state.blueprint_parts['achievements'] = {}
+            for i, work_item in enumerate(resume.work):
+                if work_item.highlights:
+                    for j, highlight in enumerate(work_item.highlights):
+                        unique_key = f"{i}_{j}"
+                        result = generation_agent.blueprint_step_4_achievements(highlight, work_item.name, st.session_state.job_description)
+                        if 'error' not in result:
+                            st.session_state.blueprint_parts['achievements'][unique_key] = result
+            st.success("Achievement suggestions updated.")
+            st.rerun()
     for key, result in st.session_state.blueprint_parts.get('achievements', {}).items():
         try:
             work_idx, highlight_idx = map(int, key.split('_'))
