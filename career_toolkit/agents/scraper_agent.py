@@ -1,8 +1,7 @@
 import requests
 from bs4 import BeautifulSoup
 from .data_agent import JobDescription
-# The generation_agent will be used for advanced parsing.
-# from .generation_agent import GenerationAgent
+from typing import Dict, Tuple, Optional
 
 class ScraperAgent:
     def __init__(self):
@@ -39,4 +38,34 @@ class ScraperAgent:
         except requests.exceptions.RequestException as e:
             print(f"Error fetching URL: {e}")
             return ""
+
+    def structure_from_text(self, text: str, generation_agent) -> Dict:
+        """
+        Structures a raw job description text into the enhanced schema via GenerationAgent.
+
+        Note: Pass an initialized GenerationAgent instance. We avoid importing it here to prevent cycles.
+        """
+        if not text or not text.strip():
+            return {}
+        try:
+            return generation_agent.structure_job_description_schema_v1(text)
+        except Exception as e:
+            print(f"Error structuring job description text: {e}")
+            return {}
+
+    def structure_from_url(self, url: str, generation_agent) -> Tuple[str, Dict]:
+        """
+        Fetches a job posting from a URL and returns a tuple of (raw_text, structured_json).
+
+        - raw_text: combined extracted text from the page
+        - structured_json: output of GenerationAgent.structure_job_description_schema_v1(raw_text)
+        """
+        raw = self.scrape_job_description(url)
+        structured = {}
+        if raw:
+            try:
+                structured = generation_agent.structure_job_description_schema_v1(raw)
+            except Exception as e:
+                print(f"Error structuring job description from URL: {e}")
+        return raw, structured
 
